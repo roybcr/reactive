@@ -10,7 +10,7 @@ use std::{
 };
 
 type ComputeFn<T> = Box<dyn Fn(&[T]) -> T>;
-type CallbackFn<T> = Box<dyn FnMut(T) + 'static>;
+type CallbackFn<'a, T> = Box<dyn FnMut(T) + 'a>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputCellId(pub usize);
@@ -49,12 +49,24 @@ pub enum RemoveCallbackError {
     NonexistentCallback,
 }
 
-pub enum Callback<T>
+pub enum Callback<'a, T>
 where
     T: Copy + PartialEq + Debug,
 {
     Removed,
-    Exists(CallbackFn<T>),
+    Exists(CallbackFn<'a, T>),
+}
+
+impl<'a, T> Debug for Callback<'a, T>
+where
+    T: Copy + PartialEq + Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Callback::Removed => f.write_fmt(format_args!("Removed")),
+            Callback::Exists(_) => f.write_fmt(format_args!("Exists")),
+        }
+    }
 }
 
 pub enum Compute<T>
@@ -83,26 +95,26 @@ where
     }
 }
 
-pub struct RxCell<T>
+pub struct RxCell<'a, T>
 where
-    T: Copy + PartialEq + Debug,
+    T: Copy + PartialEq + Debug + 'a,
 {
     pub id: CellId,
     pub val: Cell<T>,
     pub deps: Vec<CellId>,
-    pub callbacks: Rc<RefCell<Vec<Callback<T>>>>,
+    pub callbacks: RefCell<Vec<Callback<'a, T>>>,
 }
 
-impl<T> RxCell<T>
+impl<'a, T> RxCell<'a, T>
 where
-    T: Copy + PartialEq + Debug,
+    T: Copy + PartialEq + Debug + 'a,
 {
     pub fn new(id: CellId, val: T, deps: Vec<CellId>) -> Self {
         RxCell {
             id,
             deps,
             val: Cell::new(val),
-            callbacks: Rc::new(RefCell::new(vec![])),
+            callbacks: RefCell::new(vec![]),
         }
     }
 
@@ -110,18 +122,42 @@ where
         self.val.get()
     }
 
-    pub fn recompute(&self, compute: &Compute<T>, vals: &[T]) -> T {
+    pub fn recompute(
+        &self,
+        compute: &Compute<T>,
+        vals: &[T],
+        called: &mut HashMap<usize, Vec<usize>>,
+    ) -> T {
         let old_value = self.val.get();
         let new_value = compute.get_computed(vals);
 
+        println!("{:?}", called);
+        let mut i = 0;
         if old_value.ne(&new_value) {
             for callback in self.callbacks.borrow_mut().as_mut_slice() {
                 match callback {
-                    Callback::Removed => {}
+                    Callback::Removed => {
+                        println!("Skipping removed callback {i} of cell {}", self.id.get_id());
+                    }
                     Callback::Exists(cb) => {
+                        if let Some(called_callbacks) = called.get(&self.id.get_id()) {
+                            if let Some(_) = called_callbacks.get(i) {
+                                println!("Skipping callback {i} of cell {}", self.id.get_id());
+                                continue;
+                            }
+                        }
+
+                        called
+                            .entry(self.id.get_id())
+                            .and_modify(|called_ids| (*called_ids).push(i))
+                            .or_insert(vec![i]);
+
+                        println!("Calling callback {i} for cell {}", self.id.get_id());
                         cb(new_value);
                     }
                 }
+
+                i += 1;
             }
 
             return new_value;
@@ -131,9 +167,9 @@ where
     }
 }
 
-impl<T> Debug for RxCell<T>
+impl<'a, T> Debug for RxCell<'a, T>
 where
-    T: Copy + PartialEq + Debug,
+    T: Copy + PartialEq + Debug + 'a,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RxCell")
@@ -144,16 +180,16 @@ where
     }
 }
 
-pub struct Reactor<T>
+pub struct Reactor<'a, T>
 where
     T: Copy + PartialEq + Debug,
 {
-    pub cells: Vec<RxCell<T>>,
+    pub cells: Vec<RxCell<'a, T>>,
     pub funcs: Vec<Rc<Compute<T>>>,
     pub graph: HashMap<usize, Vec<CellId>>,
 }
 
-impl<T> Debug for Reactor<T>
+impl<T> Debug for Reactor<'_, T>
 where
     T: Copy + PartialEq + Debug,
 {
@@ -167,7 +203,7 @@ where
 
 // You are guaranteed that Reactor will only be tested against types that are
 // Copy + PartialEq.
-impl<T: Copy + PartialEq + Debug> Reactor<T> {
+impl<'a, T: Copy + PartialEq + Debug> Reactor<'a, T> {
     pub fn new() -> Self {
         Reactor {
             cells: vec![],
@@ -236,6 +272,7 @@ impl<T: Copy + PartialEq + Debug> Reactor<T> {
 
                 if let Some(deps) = self.graph.get(&idx) {
                     let deps = deps.iter().filter(|&d| d.is_compute());
+                    let mut called = HashMap::<usize, Vec<usize>>::new();
 
                     for &dep in deps {
                         let dep_idx = dep.get_id();
@@ -248,8 +285,8 @@ impl<T: Copy + PartialEq + Debug> Reactor<T> {
                                 .collect::<Vec<T>>();
 
                             let dep_compute_fn = Rc::clone(self.funcs.get(dep_idx).unwrap());
-
-                            let new_value = dep_cell.recompute(dep_compute_fn.as_ref(), &vals);
+                            let new_value =
+                                dep_cell.recompute(dep_compute_fn.as_ref(), &vals, &mut called);
 
                             if new_value.eq(&cell.get_value()) {
                                 continue;
@@ -278,19 +315,19 @@ impl<T: Copy + PartialEq + Debug> Reactor<T> {
     //    * Exactly once if the compute cell's value changed as a result of the
     //      set_value call. The value passed to the callback should be the final
     //      value of the compute cell after the set_value call.
-    pub fn add_callback<F: FnMut(T)>(
+    pub fn add_callback<F: FnMut(T) + 'a>(
         &mut self,
-        _id: ComputeCellId,
-        _callback: F,
+        id: ComputeCellId,
+        callback: F,
     ) -> Option<CallbackId> {
-        unimplemented!();
-        // if let Some(cell) = self.cells.get(idx) {
-        //     let callback_id = CallbackId(cell.callbacks.borrow().len());
-        //     let callbacks = Rc::clone(&cell.callbacks);
-        //     let boxed_cb = Box::new(callback);
-        //     return Some(callback_id);
-        // }
-        // None
+        let ComputeCellId(idx) = id;
+        if let Some(cell) = self.cells.get(idx) {
+            let callback_id = CallbackId(cell.callbacks.borrow().len());
+            (*cell.callbacks.borrow_mut()).push(Callback::Exists(Box::new(callback)));
+            return Some(callback_id);
+        }
+
+        None
     }
 
     // Removes the specified callback, using an ID returned from
@@ -302,10 +339,21 @@ impl<T: Copy + PartialEq + Debug> Reactor<T> {
         cell: ComputeCellId,
         callback: CallbackId,
     ) -> Result<(), RemoveCallbackError> {
-        unimplemented!(
-            "Remove the callback identified by the CallbackId {callback:?} \
-             from the cell {cell:?}"
-        )
+        let ComputeCellId(cell_idx) = cell;
+        let CallbackId(cb_idx) = callback;
+
+        match self.cells.get(cell_idx) {
+            None => Err(RemoveCallbackError::NonexistentCell),
+            Some(cell) => {
+                if let Some(cb) = (*cell.callbacks.borrow_mut()).get_mut(cb_idx) {
+                    *cb = Callback::Removed;
+                    println!("{:?}", cb);
+                    return Ok(());
+                }
+
+                Err(RemoveCallbackError::NonexistentCallback)
+            }
+        }
     }
 }
 
@@ -506,7 +554,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn compute_cells_fire_callbacks() {
         let cb = CallbackRecorder::new();
         let mut reactor = Reactor::new();
@@ -523,7 +570,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn error_adding_callback_to_nonexistent_cell() {
         let mut dummy_reactor = Reactor::new();
         let input = dummy_reactor.create_input(1);
@@ -538,7 +584,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn error_removing_callback_from_nonexisting_cell() {
         let mut dummy_reactor = Reactor::new();
         let dummy_input = dummy_reactor.create_input(1);
@@ -562,7 +607,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn callbacks_only_fire_on_change() {
         let cb = CallbackRecorder::new();
         let mut reactor = Reactor::new();
@@ -590,7 +634,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn callbacks_can_be_called_multiple_times() {
         let cb = CallbackRecorder::new();
         let mut reactor = Reactor::new();
@@ -609,7 +652,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn callbacks_can_be_called_from_multiple_cells() {
         let cb1 = CallbackRecorder::new();
         let cb2 = CallbackRecorder::new();
@@ -635,7 +677,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn callbacks_can_be_added_and_removed() {
         let cb1 = CallbackRecorder::new();
         let cb2 = CallbackRecorder::new();
@@ -669,7 +710,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn removing_a_callback_multiple_times_doesnt_interfere_with_other_callbacks() {
         let cb1 = CallbackRecorder::new();
         let cb2 = CallbackRecorder::new();
@@ -704,7 +744,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn callbacks_should_only_be_called_once_even_if_multiple_dependencies_change() {
         let cb = CallbackRecorder::new();
         let mut reactor = Reactor::new();
@@ -733,7 +772,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn callbacks_should_not_be_called_if_dependencies_change_but_output_value_doesnt_change() {
         let cb = CallbackRecorder::new();
         let mut reactor = Reactor::new();
@@ -761,7 +799,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_adder_with_boolean_values() {
         // This is a digital logic circuit called an adder:
         // https://en.wikipedia.org/wiki/Adder_(electronics)
