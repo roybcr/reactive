@@ -122,42 +122,18 @@ where
         self.val.get()
     }
 
-    pub fn recompute(
-        &self,
-        compute: &Compute<T>,
-        vals: &[T],
-        called: &mut HashMap<usize, Vec<usize>>,
-    ) -> T {
+    pub fn recompute(&self, compute: &Compute<T>, vals: &[T]) -> T {
         let old_value = self.val.get();
         let new_value = compute.get_computed(vals);
 
-        println!("{:?}", called);
-        let mut i = 0;
         if old_value.ne(&new_value) {
             for callback in self.callbacks.borrow_mut().as_mut_slice() {
                 match callback {
-                    Callback::Removed => {
-                        println!("Skipping removed callback {i} of cell {}", self.id.get_id());
-                    }
+                    Callback::Removed => {}
                     Callback::Exists(cb) => {
-                        if let Some(called_callbacks) = called.get(&self.id.get_id()) {
-                            if let Some(_) = called_callbacks.get(i) {
-                                println!("Skipping callback {i} of cell {}", self.id.get_id());
-                                continue;
-                            }
-                        }
-
-                        called
-                            .entry(self.id.get_id())
-                            .and_modify(|called_ids| (*called_ids).push(i))
-                            .or_insert(vec![i]);
-
-                        println!("Calling callback {i} for cell {}", self.id.get_id());
                         cb(new_value);
                     }
                 }
-
-                i += 1;
             }
 
             return new_value;
@@ -272,7 +248,6 @@ impl<'a, T: Copy + PartialEq + Debug> Reactor<'a, T> {
 
                 if let Some(deps) = self.graph.get(&idx) {
                     let deps = deps.iter().filter(|&d| d.is_compute());
-                    let mut called = HashMap::<usize, Vec<usize>>::new();
 
                     for &dep in deps {
                         let dep_idx = dep.get_id();
@@ -285,8 +260,7 @@ impl<'a, T: Copy + PartialEq + Debug> Reactor<'a, T> {
                                 .collect::<Vec<T>>();
 
                             let dep_compute_fn = Rc::clone(self.funcs.get(dep_idx).unwrap());
-                            let new_value =
-                                dep_cell.recompute(dep_compute_fn.as_ref(), &vals, &mut called);
+                            let new_value = dep_cell.recompute(dep_compute_fn.as_ref(), &vals);
 
                             if new_value.eq(&cell.get_value()) {
                                 continue;
