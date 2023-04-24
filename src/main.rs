@@ -4,24 +4,25 @@ fn main() {}
 
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt::Debug,
+    hash::Hash,
     rc::Rc,
 };
 
 type ComputeFn<T> = Box<dyn Fn(&[T]) -> T>;
 type CallbackFn<'a, T> = Box<dyn FnMut(T) + 'a>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct InputCellId(pub usize);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ComputeCellId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallbackId(pub usize);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CellId {
     Input(InputCellId),
     Compute(ComputeCellId),
@@ -35,7 +36,7 @@ impl CellId {
         }
     }
 
-    pub fn is_compute(&self) -> bool {
+    fn is_compute(&self) -> bool {
         match self {
             CellId::Input(_) => false,
             CellId::Compute(_) => true,
@@ -101,7 +102,7 @@ where
 {
     pub id: CellId,
     pub val: Cell<T>,
-    pub deps: Vec<CellId>,
+    pub deps: HashSet<CellId>,
     pub callbacks: RefCell<Vec<Callback<'a, T>>>,
 }
 
@@ -109,13 +110,23 @@ impl<'a, T> RxCell<'a, T>
 where
     T: Copy + PartialEq + Debug + 'a,
 {
-    pub fn new(id: CellId, val: T, deps: Vec<CellId>) -> Self {
+    pub fn new(id: CellId, val: T, deps: &[CellId]) -> Self {
+        let mut set = HashSet::new();
+
+        for &dep in deps {
+            set.insert(dep);
+        }
+
         RxCell {
             id,
-            deps,
+            deps: set,
             val: Cell::new(val),
             callbacks: RefCell::new(vec![]),
         }
+    }
+
+    pub fn is_compute(&self) -> bool {
+        self.id.is_compute()
     }
 
     pub fn get_value(&self) -> T {
@@ -163,6 +174,7 @@ where
     pub cells: Vec<RxCell<'a, T>>,
     pub funcs: Vec<Rc<Compute<T>>>,
     pub graph: HashMap<usize, Vec<CellId>>,
+    pub cache: RefCell<HashMap<CellId, T>>,
 }
 
 impl<T> Debug for Reactor<'_, T>
@@ -184,6 +196,7 @@ impl<'a, T: Copy + PartialEq + Debug> Reactor<'a, T> {
         Reactor {
             cells: vec![],
             funcs: vec![],
+            cache: RefCell::new(HashMap::new()),
             graph: HashMap::<usize, Vec<CellId>>::new(),
         }
     }
@@ -191,9 +204,11 @@ impl<'a, T: Copy + PartialEq + Debug> Reactor<'a, T> {
     pub fn create_input(&mut self, initial: T) -> InputCellId {
         let idx = self.cells.len();
         let iid = InputCellId(idx);
+        let cid = CellId::Input(iid.clone());
+
         self.funcs.push(Rc::new(Compute::new_identity(initial)));
-        self.cells
-            .push(RxCell::new(CellId::Input(iid.clone()), initial, vec![]));
+        self.cells.push(RxCell::new(cid, initial, &[]));
+        (*self.cache.borrow_mut()).insert(cid, initial);
 
         iid
     }
@@ -208,20 +223,22 @@ impl<'a, T: Copy + PartialEq + Debug> Reactor<'a, T> {
         let iid = ComputeCellId(len);
         let cid = CellId::Compute(iid);
 
-        for &cell_id in dependencies[..].iter() {
-            let iid = cell_id.get_id();
-            match self.cells.get(iid) {
-                None => {
-                    return Err(cell_id);
-                }
-                Some(cell) => {
-                    vals.push(cell.get_value());
-                    self.graph
-                        .entry(iid)
-                        .and_modify(|cells| (*cells).push(cid))
-                        .or_insert(vec![cid]);
-                }
-            };
+        for cell_id in dependencies[..].iter() {
+            if let Some(cached_entry) = self.cache.borrow().get(cell_id) {
+                vals.push(*cached_entry);
+            } else {
+                match self.cells.get(cell_id.get_id()) {
+                    Some(cell) => vals.push(cell.get_value()),
+                    None => {
+                        return Err(*cell_id);
+                    }
+                };
+            }
+
+            self.graph
+                .entry(cell_id.get_id())
+                .and_modify(|cells| (*cells).push(cid))
+                .or_insert(vec![cid]);
         }
 
         let computed_value = compute_func(&vals);
@@ -229,7 +246,7 @@ impl<'a, T: Copy + PartialEq + Debug> Reactor<'a, T> {
 
         self.funcs.push(Rc::new(Compute::new_computed(boxed_cb)));
         self.cells
-            .push(RxCell::new(cid, computed_value, dependencies.to_vec()));
+            .push(RxCell::new(cid, computed_value, dependencies));
 
         Ok(iid)
     }
@@ -245,6 +262,7 @@ impl<'a, T: Copy + PartialEq + Debug> Reactor<'a, T> {
             None => false,
             Some(cell) => {
                 cell.val.set(new_value);
+                (*self.cache.borrow_mut()).insert(CellId::Input(id), new_value);
 
                 if let Some(deps) = self.graph.get(&idx) {
                     let deps = deps.iter().filter(|&d| d.is_compute());
@@ -273,6 +291,16 @@ impl<'a, T: Copy + PartialEq + Debug> Reactor<'a, T> {
 
                 true
             }
+        }
+    }
+
+    pub fn calc_compute(&self, id: ComputeCellId) -> Option<T> {
+        match self.cells.get(id.0) {
+            None => None,
+            // TODO: should implement a recursive computation
+            // for compute cell depends on other compute
+            // cells
+            Some(cell) => Some(cell.get_value()),
         }
     }
 
